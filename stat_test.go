@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -15,8 +16,10 @@ import (
 // commands based on message-id. replies maps a bare message-id to the status
 // line to return; ids absent from the map get a 430. Every received command
 // (except DATE pings) is appended to cmdLog under mu.
-func makeStatByIDFactory(t *testing.T, mu *sync.Mutex, cmdLog *[]string, replies map[string]string) ConnFactory {
-	t.Helper()
+func makeStatByIDFactory(t testing.TB, mu *sync.Mutex, cmdLog *[]string, replies map[string]string) ConnFactory {
+	if t != nil {
+		t.Helper()
+	}
 	return func(ctx context.Context) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
@@ -281,6 +284,207 @@ func TestStatMany_UnknownProvider(t *testing.T) {
 	}
 }
 
+// TestStatMany_SkipOmitsResult pins the contract: a skipped id emits no STAT
+// command and no result, while every non-skipped id still gets exactly one.
+func TestStatMany_SkipOmitsResult(t *testing.T) {
+	var mu sync.Mutex
+	var cmdLog []string
+	ids := []string{"a@h", "b@h", "c@h"}
+	replies := map[string]string{
+		"a@h": "223 1 <a@h> exists",
+		"b@h": "223 2 <b@h> exists",
+		"c@h": "223 3 <c@h> exists",
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, &mu, &cmdLog, replies),
+		Connections: 3,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Skip: func(messageID string) bool { return messageID == "b@h" },
+	}))
+
+	if _, ok := got["b@h"]; ok {
+		t.Errorf("skipped id b@h produced a result: %+v", got["b@h"])
+	}
+	for _, id := range []string{"a@h", "c@h"} {
+		r, ok := got[id]
+		if !ok {
+			t.Fatalf("missing result for non-skipped id %s", id)
+		}
+		if r.Err != nil || r.Result == nil {
+			t.Errorf("%s: err=%v result=%v", id, r.Err, r.Result)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d results, want 2 (skipped id must not appear)", len(got))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, cmd := range cmdLog {
+		if strings.Contains(cmd, "b@h") {
+			t.Errorf("skipped id b@h was STATed: %q", cmd)
+		}
+	}
+}
+
+// TestStatMany_SkipStopsFurtherDispatch confirms Skip can be flipped mid-sweep
+// to abandon the remaining ids without chunking: once it starts returning
+// true, none of the later ids should ever reach the wire.
+func TestStatMany_SkipStopsFurtherDispatch(t *testing.T) {
+	var mu sync.Mutex
+	var cmdLog []string
+	const n = 50
+	const cutoff = 20 // ids at/after this index are abandoned
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("s%02d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, &mu, &cmdLog, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	var abandoned atomic.Bool
+	skip := func(messageID string) bool {
+		if abandoned.Load() {
+			return true
+		}
+		// Flip once we see the id that marks the cutoff, so every id from
+		// cutoff onward is abandoned (dispatch order isn't guaranteed, but the
+		// cutoff id itself is always observed by the predicate before being
+		// STATed, since Skip runs before dispatch).
+		if messageID == ids[cutoff] {
+			abandoned.Store(true)
+			return true
+		}
+		return false
+	}
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Concurrency: 1, // serial dispatch makes the cutoff point deterministic
+		Skip:        skip,
+	}))
+
+	for i := cutoff; i < n; i++ {
+		if _, ok := got[ids[i]]; ok {
+			t.Errorf("id %s at/after cutoff produced a result", ids[i])
+		}
+	}
+	for i := range cutoff {
+		if _, ok := got[ids[i]]; !ok {
+			t.Errorf("id %s before cutoff is missing a result", ids[i])
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := cutoff; i < n; i++ {
+		for _, cmd := range cmdLog {
+			if strings.Contains(cmd, ids[i]) {
+				t.Errorf("abandoned id %s was STATed: %q", ids[i], cmd)
+			}
+		}
+	}
+}
+
+// TestStatMany_SkipNil is a regression guard: a nil Skip must behave exactly
+// as if the option didn't exist.
+func TestStatMany_SkipNil(t *testing.T) {
+	ids := []string{"a@h", "b@h"}
+	replies := map[string]string{
+		"a@h": "223 1 <a@h> exists",
+		"b@h": "223 2 <b@h> exists",
+	}
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{Skip: nil}))
+	if len(got) != len(ids) {
+		t.Fatalf("got %d results, want %d", len(got), len(ids))
+	}
+	for _, id := range ids {
+		if r := got[id]; r.Err != nil || r.Result == nil {
+			t.Errorf("%s: err=%v result=%v", id, r.Err, r.Result)
+		}
+	}
+}
+
+// TestStatMany_SkipConcurrencySafety exercises Skip under -race with a wide
+// concurrency and a closure that reads/writes shared state behind a mutex, to
+// confirm Skip is safe to call from every dispatch goroutine concurrently.
+func TestStatMany_SkipConcurrencySafety(t *testing.T) {
+	const n = 300
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("r%03d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 8,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	var mu sync.Mutex
+	seenBySkip := make(map[string]bool, n)
+	skip := func(messageID string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		seenBySkip[messageID] = true
+		// Skip every other id (by parity of its numeric suffix) to exercise a
+		// mixed skip/non-skip workload under race detection.
+		var idx int
+		_, _ = fmt.Sscanf(messageID, "r%03d@h", &idx)
+		return idx%2 == 0
+	}
+
+	got := collectStat(c.StatMany(context.Background(), ids, StatManyOptions{
+		Concurrency: 128,
+		Skip:        skip,
+	}))
+
+	for i, id := range ids {
+		_, hasResult := got[id]
+		wantSkipped := i%2 == 0
+		if wantSkipped && hasResult {
+			t.Errorf("%s: expected skip, got result", id)
+		}
+		if !wantSkipped && !hasResult {
+			t.Errorf("%s: expected result, got none", id)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenBySkip) != n {
+		t.Fatalf("Skip observed %d distinct ids, want %d", len(seenBySkip), n)
+	}
+}
+
 func TestStatPriority(t *testing.T) {
 	c, err := NewClient(context.Background(), []Provider{{
 		Factory:     makeStatByIDFactory(t, nil, nil, map[string]string{"p@h": "223 7 <p@h> exists"}),
@@ -365,5 +569,110 @@ func TestStatCapacity(t *testing.T) {
 				t.Errorf("StatCapacity() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestStatMany_CompletenessUnderWideConcurrency pins the property the dispatch
+// rewrite must preserve: every id yields exactly one result, with no duplicates
+// and none dropped, even when workers vastly outnumber the ids they share.
+func TestStatMany_CompletenessUnderWideConcurrency(t *testing.T) {
+	const n = 500
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("m%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 4,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	seen := make(map[string]int, n)
+	for res := range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: 256}) {
+		seen[res.MessageID]++
+	}
+
+	if len(seen) != n {
+		t.Fatalf("got %d distinct results, want %d", len(seen), n)
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Errorf("%s: %d results, want exactly 1", id, count)
+		}
+	}
+}
+
+// TestStatMany_CancelMidSweepClosesChannel pins the documented contract: on
+// cancellation dispatch stops, in-flight checks are cancelled, and the channel
+// is closed, so a caller ranging over it always terminates.
+func TestStatMany_CancelMidSweepClosesChannel(t *testing.T) {
+	const n = 2000
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("c%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(t, nil, nil, replies),
+		Connections: 2,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := c.StatMany(ctx, ids, StatManyOptions{Concurrency: 64})
+
+	got := 0
+	for range ch {
+		got++
+		if got == 10 {
+			cancel()
+		}
+	}
+	// Reaching here at all is the assertion: the range terminated, so the
+	// channel was closed rather than leaked.
+	if got >= n {
+		t.Fatalf("drained all %d results despite cancelling after 10", n)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("context should be cancelled")
+	}
+}
+
+// BenchmarkStatManyDispatch isolates dispatch cost: every STAT is answered
+// immediately, so what it measures is the hand-off machinery, not the wire.
+func BenchmarkStatManyDispatch(b *testing.B) {
+	const n = 4096
+	ids := make([]string, n)
+	replies := make(map[string]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("b%04d@h", i)
+		replies[ids[i]] = fmt.Sprintf("223 %d <%s> exists", i, ids[i])
+	}
+
+	c, err := NewClient(context.Background(), []Provider{{
+		Factory:     makeStatByIDFactory(nil, nil, nil, replies),
+		Connections: 8,
+	}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	b.ResetTimer()
+	for range b.N {
+		for range c.StatMany(context.Background(), ids, StatManyOptions{Concurrency: n}) {
+		}
 	}
 }

@@ -108,6 +108,16 @@ const (
 	// issues at most one SetReadDeadline syscall per quantum instead of one per
 	// read.
 	stallDeadlineQuantum = 250 * time.Millisecond
+
+	// defaultStreamInflight is the priority-lane body cap per connection when
+	// Provider.StreamInflight is unset: deep enough to pipeline, shallow
+	// enough that a demand read waits behind at most three stream bodies.
+	defaultStreamInflight = 4
+
+	// defaultAbortDrainBytes is the remaining-body size above which an
+	// abandoned drain is cut by closing the connection. A 750 KB article
+	// finishes draining in less time than a reconnect; a 4 MiB one does not.
+	defaultAbortDrainBytes int64 = 1 << 20
 )
 
 // Attempt lifecycle states, coordinating the race between tryGroup's attempt
@@ -182,6 +192,15 @@ type Request struct {
 	// deadline no longer applies — the connection's rolling stall timeout does.
 	attemptDeadline time.Time
 
+	// attemptWindow is the duration attemptDeadline was derived from. The
+	// reader re-anchors it at the moment it starts draining this request's
+	// response (drain start + attemptWindow), so time spent queued behind
+	// other pipelined responses never counts against the TTFB bound —
+	// dispatch-anchored read deadlines let one deep request burst expire the
+	// whole pipeline and tear the connection down. Zero falls back to
+	// attemptDeadline as-is.
+	attemptWindow time.Duration
+
 	// attemptState is one of attemptPending/attemptCommitted/attemptAbandoned.
 	// The reader CASes pending→committed on the first response byte; tryGroup's
 	// timer CASes pending→abandoned on expiry. Zero value is attemptPending.
@@ -196,9 +215,46 @@ type Request struct {
 	// bodySem slot, so readerLoop releases exactly the slots that were taken.
 	// Bodyless STAT requests never acquire bodySem and leave this false.
 	heldBody bool
+	// heldPrio is set when the request also took a prioBodySem slot.
+	heldPrio bool
+	// lane is the request lane this attempt was dispatched on; see lane.
+	lane lane
+	// heldBg is set once a background-lane request is on the wire and has
+	// been counted in its provider group's bgInflight, so the reader (or the
+	// pending drain) releases exactly what was counted.
+	heldBg bool
 
 	// providerName identifies the provider group selected for this attempt.
 	providerName string
+}
+
+// lane is which of the three request queues an attempt is dispatched on.
+// Every connection writer reads them in strict preference order: priority,
+// then normal, then background. Priority is for reads something is blocked
+// on (a player waiting for the next article); normal is the default; background
+// is for work nobody is waiting on — a PAR2 repair reading a whole release, or
+// the liveness census that prices it — which may use every idle connection
+// but must never queue ahead of the other two.
+type lane uint8
+
+const (
+	laneNormal lane = iota
+	lanePriority
+	laneBackground
+)
+
+// isPriority reports whether the request rides the priority lane.
+func (r *Request) isPriority() bool { return r.lane == lanePriority }
+
+// escalated is the lane a retry after a 430 rides: a normal request steps up
+// to priority so the failover to the next provider is not queued behind
+// read-ahead, while background work stays background — nobody is waiting on
+// it, so it has no claim to jump the queue however many providers it visits.
+func (l lane) escalated(post430 bool) lane {
+	if post430 && l == laneNormal {
+		return lanePriority
+	}
+	return l
 }
 
 type Response struct {
@@ -232,11 +288,27 @@ type NNTPConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	reqCh     <-chan *Request
-	prioCh    <-chan *Request // priority channel; nil for standalone connections
-	hotReqCh  <-chan *Request // unbuffered; set by runConnSlot before Run()
-	hotPrioCh <-chan *Request // unbuffered; set by runConnSlot before Run()
-	pending   chan *Request
+	reqCh         <-chan *Request
+	prioCh        <-chan *Request // priority channel; nil for standalone connections
+	hotReqCh      <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotPrioCh     <-chan *Request // unbuffered; set by runConnSlot before Run()
+	hotIdleBodyCh <-chan *Request // unbuffered; read ONLY while this connection has no body in flight
+	bgCh          <-chan *Request // background lane; read only when priority and normal are empty (see bgLane)
+	pending       chan *Request
+
+	// bgPending counts background-lane requests this connection has written
+	// and not yet seen replied. While it is non-zero the connection is
+	// dedicated to background work: it reads no foreground lane, so a stream
+	// body never queues behind pipelined background STATs (seconds each for a
+	// missing article on some providers). Written by the writer, released by
+	// the reader.
+	bgPending atomic.Int32
+
+	// wake is poked by the reader whenever a reply completes, so a writer
+	// parked with lanes disarmed (pipeline busy, or dedicated to background)
+	// re-evaluates them the moment the pipeline changes instead of waiting
+	// for an unrelated request or a timer.
+	wake chan struct{}
 
 	// inflightSem bounds the total pipeline depth (cap = StatInflight, i.e.
 	// max(Inflight, StatInflight)). bodySem additionally bounds concurrent
@@ -246,6 +318,10 @@ type NNTPConnection struct {
 	// deeper StatInflight depth.
 	inflightSem chan struct{}
 	bodySem     chan struct{}
+	// prioBodySem additionally bounds priority-lane bodies (cap =
+	// StreamInflight); nil when the cap is disabled.
+	prioBodySem     chan struct{}
+	abortDrainBytes int64 // see Provider.AbortDrainBytes; 0 = never abort
 
 	rb readBuffer
 
@@ -315,6 +391,7 @@ func newNNTPConnectionFromConn(ctx context.Context, conn net.Conn, inflightLimit
 		prioCh:      prioCh,
 		pending:     make(chan *Request, inflightLimit),
 		inflightSem: make(chan struct{}, inflightLimit),
+		wake:        make(chan struct{}, 1),
 		// Default bodySem to the full pipeline depth (no separate BODY bound);
 		// runConnSlot overrides this to Provider.Inflight when a deeper STAT
 		// pipeline is configured. Standalone connections keep them equal.
@@ -445,17 +522,50 @@ func isCheapCommand(payload []byte) bool {
 }
 
 // tryNextRequest performs a non-blocking receive across the request channels,
-// preserving the preference order of the blocking select the writer falls back
-// to: hot channels first, so a request lands on an already-connected slot
-// rather than waking a cold one, then priority and normal with no bias between
-// them. Receives from nil channels are never ready, so the standalone path
-// (prioCh and the hot channels nil) probes reqCh alone.
+// probing idleBodyChan() first and then, among the four request lanes, in
+// strict preference order: hot priority, cold priority, hot normal, cold
+// normal. Priority always outranks normal — including a cold priority request
+// over a hot normal one, because a stream waiting on a body cares far more
+// about being dispatched at all than about landing on an already-warm
+// connection.
+//
+// The idleBodyChan() probe here can never actually fire: a send to it (see
+// tryGroupTimeout) is itself a non-blocking select with a default case, so it
+// only succeeds against a receiver that is genuinely parked (blocked, not
+// polling) on the channel — which this probe, by construction, never is. It
+// stays for symmetry with the same case in the writer's blocking select below,
+// where the real hand-off happens; it is harmless here, just unreachable.
+//
+// Each lane is its own non-blocking select rather than one combined select,
+// because Go chooses uniformly among ready cases: a single select over prioCh
+// and reqCh makes "priority" a coin flip exactly when both lanes are busy.
+// Receives from nil channels are never ready, so the standalone path (prioCh and
+// the hot channels nil) probes reqCh alone.
 //
 // got reports whether any channel was ready; ok is false when the channel that
 // fired was closed.
 func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
+	if c.bgPending.Load() > 0 {
+		select {
+		case req, ok = <-c.bgLane():
+			return req, ok, true
+		default:
+		}
+		return nil, false, false
+	}
 	select {
-	case req, ok = <-c.hotPrioCh:
+	case req, ok = <-c.idleBodyChan():
+		return req, ok, true
+	default:
+	}
+	hotPrio, coldPrio := c.prioLanes()
+	select {
+	case req, ok = <-hotPrio:
+		return req, ok, true
+	default:
+	}
+	select {
+	case req, ok = <-coldPrio:
 		return req, ok, true
 	default:
 	}
@@ -465,13 +575,220 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	default:
 	}
 	select {
-	case req, ok = <-c.prioCh:
-		return req, ok, true
 	case req, ok = <-c.reqCh:
 		return req, ok, true
 	default:
 	}
+	select {
+	case req, ok = <-c.bgLane():
+		return req, ok, true
+	default:
+	}
 	return nil, false, false
+}
+
+// bgLane returns the background lane this connection may read from, or nil
+// (never ready in a select) when it must not take background work right now.
+func (c *NNTPConnection) bgLane() <-chan *Request {
+	// Background work lands only on an empty pipeline — or behind other
+	// background work already pipelined here. Behind a foreground body it
+	// would inherit that body's transfer time, and the connection could not
+	// be dedicated (see bgPending) without stalling the body's owner.
+	if c.bgPending.Load() == 0 && !c.pipelineIdle() {
+		return nil
+	}
+	return backgroundLaneFor(c.stats, c.bgCh)
+}
+
+// pipelineIdle reports whether nothing is outstanding on the wire: no body in
+// flight and no pipelined reply owed. The writer holds one inflightSem slot of
+// its own while it chooses a request, hence <= 1.
+func (c *NNTPConnection) pipelineIdle() bool {
+	return len(c.bodySem) == 0 && len(c.inflightSem) <= 1
+}
+
+// foregroundLanes returns the lanes a connection may read besides background:
+// all of them normally, none while it is dedicated to background work.
+func (c *NNTPConnection) foregroundLanes() (idleBody, hotPrio, hotReq, coldPrio, req <-chan *Request) {
+	if c.bgPending.Load() > 0 {
+		return nil, nil, nil, nil, nil
+	}
+	hotPrio, coldPrio = c.prioLanes()
+	return c.idleBodyChan(), hotPrio, c.hotReqCh, coldPrio, c.reqCh
+}
+
+// noteDispatched records a request that has just been written to the wire in
+// the provider group's background gate: a background request is counted in
+// flight until its reply is read (or the pending queue is drained); anything
+// else stamps the group as having recent foreground traffic. Keepalive probes
+// carry no lane and count as foreground, which is harmless — a connection
+// idle long enough to probe is one the gate would open for anyway.
+func (c *NNTPConnection) noteDispatched(req *Request) {
+	if c.stats == nil {
+		return
+	}
+	if req.lane == laneBackground {
+		c.stats.bgInflight.Add(1)
+		c.bgPending.Add(1)
+		req.heldBg = true
+		return
+	}
+	c.stats.lastForeground.Store(time.Now().UnixNano())
+}
+
+// pokeWriter tells a parked writer that the pipeline changed. Non-blocking:
+// one pending poke is enough, the writer re-reads all state when it wakes.
+func (c *NNTPConnection) pokeWriter() {
+	if c.wake == nil {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// releaseBackground undoes noteDispatched's count for a background request,
+// exactly once.
+func (c *NNTPConnection) releaseBackground(req *Request) {
+	if req.heldBg && c.stats != nil {
+		req.heldBg = false
+		c.stats.bgInflight.Add(-1)
+		c.bgPending.Add(-1)
+	}
+}
+
+// backgroundYieldWindow is how long after the last priority- or normal-lane
+// dispatch a provider group counts as contended. Playback and imports issue
+// requests continuously, so while either runs the group stays contended and
+// background work is held to its floor; once they stop, the floor lifts after
+// this long and background may take every idle connection.
+const backgroundYieldWindow = 3 * time.Second
+
+// resolveBackgroundFloor applies Provider.BackgroundFloor's defaults and
+// clamps: a quarter of the connections by default, at least one, and never
+// the whole allowance (unless the allowance is a single connection).
+func resolveBackgroundFloor(connections, floor int) int32 {
+	if floor <= 0 {
+		floor = connections / 4
+	}
+	if floor < 1 {
+		floor = 1
+	}
+	if connections > 1 && floor > connections-1 {
+		floor = connections - 1
+	}
+	return int32(floor)
+}
+
+// backgroundRecheckInterval is how often a parked writer whose background
+// gate was closed re-evaluates it while background work is queued.
+const backgroundRecheckInterval = 200 * time.Millisecond
+
+// backgroundRecheck returns a timer channel when background work is queued on
+// bgCh but the gate handed this writer a nil lane, and nil (never ready)
+// otherwise. A writer parks with the gate's verdict frozen into its select, and
+// the events that reopen the gate — a background reply completing, foreground
+// going quiet — wake no writer by themselves; without this the queued work
+// waits for an unrelated request or an idle timer.
+func backgroundRecheck(bgCh, lane <-chan *Request) <-chan time.Time {
+	if bgCh == nil || lane != nil || len(bgCh) == 0 {
+		return nil
+	}
+	return time.After(backgroundRecheckInterval)
+}
+
+// backgroundLaneFor gates a provider group's background lane: the channel
+// when this connection may take background work, nil (never ready in a
+// select) when it may not.
+//
+// Nothing is reserved. When the group is idle — no foreground request written
+// within backgroundYieldWindow — background may hold every connection. While
+// the group is contended, background may keep only bgFloor requests in flight,
+// so a stream request arriving finds at most that many connections stuck
+// behind a background body. The floor is a minimum share, never a ceiling on
+// an idle pool, and it is soft: several writers can pass the check together,
+// so the count may briefly exceed the floor by the number of connections.
+//
+// Standalone connections (no stats) always read the lane.
+func backgroundLaneFor(stats *providerStats, bgCh <-chan *Request) <-chan *Request {
+	if stats == nil || bgCh == nil {
+		return bgCh
+	}
+	last := stats.lastForeground.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) >= backgroundYieldWindow {
+		return bgCh
+	}
+	if stats.bgInflight.Load() >= stats.bgFloor {
+		return nil
+	}
+	return bgCh
+}
+
+// idleBodyChan returns the group's idle-body channel while this connection has
+// nothing outstanding on the wire — no body-bearing request and no pipelined
+// reply still owed — and nil otherwise. A nil channel is never ready in a
+// select, so a connection whose reader is busy simply does not compete for
+// priority bodies — which is the whole point: NNTP replies are FIFO per
+// connection, so a priority body queued behind anything waits for all of it.
+//
+// This only changes the outcome when inflightSem's cap (StatInflight, i.e.
+// max(Inflight, StatInflight)) exceeds the number of body slots a busy
+// connection is holding — i.e. Inflight >= 2, or StatInflight > Inflight. At
+// nntppool's own defaults (Inflight 1, StatInflight 0, so cap == 1) a
+// body-draining connection's writer has no spare inflightSem slot at all: it
+// parks at "c.inflightSem <- struct{}{}" in the writer loop, invisible to
+// every request lane including this one, and this method is never even
+// reached for it. This method only has anything to say about a connection
+// that still has pipeline room while something is in flight.
+//
+// The pending-reply check matters because a bodyless STAT (which takes only
+// inflightSem, not bodySem — see isCheapCommand) can have up to StatInflight
+// replies pipelined ahead of a request steered here. That wait is cheap only
+// when the server answers fast, and for a missing article it does not:
+// Newshosting takes ~1.2 s per 430 and serialises them per connection, so a
+// liveness sweep over a mostly-dead release parks every connection it touches
+// for seconds — and, being body-free, those were precisely the connections a
+// bodySem-only check steered priority bodies onto (observed live as playback
+// falling from ~70 MB/s to ~5 MB/s beside such a sweep).
+//
+// The writer calls this while holding one inflightSem slot of its own (it
+// acquires capacity before choosing a request), so an empty pipeline reads as
+// len(inflightSem) <= 1. Both len() reads are the right signal (rather than
+// the caps) because readerLoop releases a slot only after the full reply has
+// been read and delivered; the window where the writer holds a slot but the
+// reader has not started counts as busy — the safe side.
+func (c *NNTPConnection) idleBodyChan() <-chan *Request {
+	if len(c.bodySem) != 0 || len(c.inflightSem) > 1 {
+		return nil
+	}
+	return c.hotIdleBodyCh
+}
+
+// prioLanes returns the priority request channels this connection may read.
+//
+// Full (StreamInflight priority bodies held): neither. The writer acquires
+// prioBodySem only after it has a request in hand, so without this a full
+// connection would keep receiving priority requests and park each behind its
+// pipeline while other slots, idle ones that would dial included, saw nothing.
+//
+// Busy (at least one priority body in flight): the cold lane only. The client
+// offers every request to the hot lane first, and a hot connection with room
+// would otherwise deepen its own pipeline while undialed slots stayed idle: at
+// a 15-connection budget only 8-12 sockets ever carried bytes. Leaving the hot
+// lane makes the request go cold, where idle slots compete for it and dial;
+// pipelines deepen only once every slot is busy.
+func (c *NNTPConnection) prioLanes() (hot, cold <-chan *Request) {
+	if c.prioBodySem == nil {
+		return c.hotPrioCh, c.prioCh
+	}
+	switch held := len(c.prioBodySem); {
+	case held >= cap(c.prioBodySem):
+		return nil, nil
+	case held > 0:
+		return nil, c.prioCh
+	}
+	return c.hotPrioCh, c.prioCh
 }
 
 func failRequest(ch chan Response, err error) {
@@ -517,6 +834,7 @@ func (c *NNTPConnection) drainPending() {
 				continue
 			}
 			failRequest(req.RespCh, connErr)
+			c.releaseBackground(req)
 			// Best-effort inflight release (not strictly needed once we're shutting down).
 			select {
 			case <-c.inflightSem:
@@ -614,6 +932,20 @@ func (g *connGate) enter(slotCtx, reqCtx context.Context) bool {
 	return true
 }
 
+// tryEnter reserves connection capacity without blocking. Cold slots use this
+// after dequeuing a request so a throttled gate cannot strand that request
+// behind connections which are already active and able to serve it.
+func (g *connGate) tryEnter() (entered bool, running int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.held >= g.allowed {
+		return false, g.running
+	}
+	g.held++
+	g.available.Store(int32(g.allowed - g.held))
+	return true, g.running
+}
+
 func (g *connGate) exit() {
 	g.mu.Lock()
 	g.held--
@@ -685,11 +1017,33 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // immediately on death), giving the provider a floor of connections that
 // stay hot independent of traffic. Callers pair preWarm with idleTimeout==0
 // so these connections are never torn down for being idle.
-func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh <-chan *Request, hotPrioCh <-chan *Request, factory ConnFactory, inflight int, statInflight int, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
+func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh chan *Request, hotPrioCh chan *Request, hotIdleBodyCh chan *Request, bgCh chan *Request, factory ConnFactory, inflight int, statInflight int, streamInflight int, abortDrainBytes int64, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
 	var sharedBuf readBuffer
+	handoffToActive := func(req *Request) {
+		if req.isPriority() && !isCheapCommand(req.Payload) {
+			select {
+			case hotIdleBodyCh <- req:
+				return
+			default:
+			}
+		}
+		hotCh := hotReqCh
+		if req.isPriority() {
+			hotCh = hotPrioCh
+		} else if req.lane == laneBackground {
+			hotCh = bgCh
+		}
+		select {
+		case hotCh <- req:
+		case <-req.Ctx.Done():
+			failRequest(req.RespCh, req.Ctx.Err())
+		case <-ctx.Done():
+			failRequest(req.RespCh, ctx.Err())
+		}
+	}
 
 	for {
 		// preWarm slots have no request to wait on, so unlike the cold path
@@ -712,6 +1066,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		gateCtx := ctx
 		if !preWarm {
 			// Prefer priority requests over normal ones.
+			bgLane := backgroundLaneFor(stats, bgCh)
 			select {
 			case firstReq, ok = <-prioCh:
 				if !ok {
@@ -727,6 +1082,12 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 					if !ok {
 						return // channel closed, shut down
 					}
+				case firstReq, ok = <-bgLane:
+					if !ok {
+						return
+					}
+				case <-backgroundRecheck(bgCh, bgLane):
+					continue
 				case <-ctx.Done():
 					return
 				}
@@ -742,15 +1103,26 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			}
 		}
 
-		// GATE: block if we're at the throttled capacity limit.
-		if !gate.enter(ctx, gateCtx) {
+		// GATE: a cold slot has already removed firstReq from the shared queue.
+		// If throttling leaves no room to dial while other connections are
+		// active, hand the request to one of those connections instead of
+		// blocking here with work that the active connections can no longer see.
+		entered := false
+		if firstReq != nil {
+			var running int
+			entered, running = gate.tryEnter()
+			if !entered && running > 0 {
+				handoffToActive(firstReq)
+				continue
+			}
+		}
+		if !entered && !gate.enter(ctx, gateCtx) {
 			// Slot or request context cancelled while waiting at the gate.
 			if firstReq != nil {
 				failRequest(firstReq.RespCh, context.Canceled)
 			}
 			continue
 		}
-
 		// CONNECTING: dial, greet, authenticate.
 		conn, err := factory(ctx)
 		if err != nil {
@@ -773,14 +1145,19 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		nc, err := newNNTPConnectionFromConn(ctx, conn, statInflight, reqCh, prioCh, auth, userAgent, &sharedBuf, stats)
 		if err != nil {
 			_ = conn.Close()
-			if firstReq != nil {
-				failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
-			}
 
 			if errors.Is(err, ErrMaxConnections) {
-				// Server said "max connections" — throttle and use longer backoff.
+				// The bootstrap request has not reached an NNTP connection. Hand it
+				// directly to an already-connected slot on its original priority lane
+				// instead of surfacing a transient capacity error to the caller.
 				gate.throttle()
 				gate.exit()
+				_, running := gate.snapshot()
+				if firstReq != nil && running > 0 {
+					handoffToActive(firstReq)
+				} else if firstReq != nil {
+					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+				}
 				select {
 				case <-time.After(maxConnsBackoff):
 				case <-ctx.Done():
@@ -788,6 +1165,9 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 				}
 			} else {
 				gate.exit()
+				if firstReq != nil {
+					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+				}
 				select {
 				case <-time.After(connFailureBackoff):
 				case <-ctx.Done():
@@ -802,12 +1182,18 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		// allows STAT to reach statInflight. When statInflight == inflight this
 		// is identical to the default (both caps equal).
 		nc.bodySem = make(chan struct{}, inflight)
+		if streamInflight > 0 {
+			nc.prioBodySem = make(chan struct{}, streamInflight)
+		}
+		nc.abortDrainBytes = abortDrainBytes
 		nc.firstReq = firstReq
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
 		nc.providerName = providerName
 		nc.hotReqCh = hotReqCh
 		nc.hotPrioCh = hotPrioCh
+		nc.hotIdleBodyCh = hotIdleBodyCh
+		nc.bgCh = bgCh
 		nc.keepaliveInterval = keepaliveInterval
 		nc.keepaliveCommand = keepaliveCommand
 		gate.markRunning()
@@ -861,7 +1247,7 @@ func (c *NNTPConnection) Run() {
 	// flushes at the moment it is about to block and not before: a run of
 	// commands queued behind one another leaves in a single write, which under
 	// TLS is a single record rather than 29 bytes of framing per command.
-	bw := bufio.NewWriterSize(c.conn, 4096)
+	bw := bufio.NewWriterSize(c.conn, 64*1024)
 
 	// flushBuffered empties the write buffer, if anything is in it.
 	flushBuffered := func() error {
@@ -932,6 +1318,25 @@ func (c *NNTPConnection) Run() {
 				failRequest(req.RespCh, c.ctx.Err())
 				return
 			}
+			// Priority-lane bodies are bounded tighter than Inflight so a
+			// demand read does not queue behind a connection's worth of
+			// read-ahead (replies are FIFO per connection).
+			if req.isPriority() && c.prioBodySem != nil {
+				select {
+				case c.prioBodySem <- struct{}{}:
+					req.heldPrio = true
+				case <-req.Ctx.Done():
+					<-c.bodySem
+					<-c.inflightSem
+					failRequest(req.RespCh, req.Ctx.Err())
+					goto mainLoop
+				case <-c.ctx.Done():
+					<-c.bodySem
+					<-c.inflightSem
+					failRequest(req.RespCh, c.ctx.Err())
+					return
+				}
+			}
 		}
 
 		dl, hasDL := req.writeDeadline()
@@ -944,6 +1349,7 @@ func (c *NNTPConnection) Run() {
 			c.failOutstanding()
 			return
 		}
+		c.noteDispatched(req)
 		if req.PostMode {
 			// Two-phase POST: flush "POST\r\n" immediately so the server can
 			// respond with 340/440 before we send the article body.
@@ -1057,11 +1463,25 @@ mainLoop:
 				<-c.inflightSem
 				return
 			}
+			idleBody, hotPrio, hotReq, coldPrio, reqLane := c.foregroundLanes()
+			bgLane := c.bgLane()
 			select {
-			case req, ok = <-c.hotPrioCh:
-			case req, ok = <-c.hotReqCh:
-			case req, ok = <-c.prioCh:
-			case req, ok = <-c.reqCh:
+			case req, ok = <-idleBody:
+			case req, ok = <-hotPrio:
+			case req, ok = <-hotReq:
+			case req, ok = <-coldPrio:
+			case req, ok = <-reqLane:
+			case req, ok = <-bgLane:
+			case <-c.wake:
+				// A reply completed: the pipeline may be idle now, or the
+				// connection no longer dedicated to background. Re-evaluate.
+				<-c.inflightSem
+				continue
+			case <-backgroundRecheck(c.bgCh, bgLane):
+				// The gate was closed when this writer parked; in-flight may
+				// have dropped since with nothing else to wake it. Re-evaluate.
+				<-c.inflightSem
+				continue
 			case <-c.ctx.Done():
 				<-c.inflightSem
 				return
@@ -1094,6 +1514,7 @@ mainLoop:
 				RespCh:          kaCh,
 				Ctx:             context.Background(),
 				attemptDeadline: time.Now().Add(c.keepaliveProbeTimeout()),
+				attemptWindow:   c.keepaliveProbeTimeout(),
 			}
 			if _, err := bw.Write(kaReq.Payload); err != nil {
 				_ = c.conn.Close()
@@ -1185,6 +1606,37 @@ mainLoop:
 					return
 				}
 			}
+			// Priority-lane bodies are bounded tighter than Inflight so a
+			// demand read does not queue behind a connection's worth of
+			// read-ahead (replies are FIFO per connection). Same flush rule:
+			// a slot only frees when a reply arrives for a sent command.
+			if req.isPriority() && c.prioBodySem != nil {
+				select {
+				case c.prioBodySem <- struct{}{}:
+					req.heldPrio = true
+				default:
+					if err := flushBuffered(); err != nil {
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, err)
+						return
+					}
+					select {
+					case c.prioBodySem <- struct{}{}:
+						req.heldPrio = true
+					case <-req.Ctx.Done():
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, req.Ctx.Err())
+						continue
+					case <-c.ctx.Done():
+						<-c.bodySem
+						<-c.inflightSem
+						failRequest(req.RespCh, c.connDiedErr())
+						return
+					}
+				}
+			}
 		}
 
 		// per-request write deadline (cached to avoid redundant syscalls)
@@ -1199,6 +1651,7 @@ mainLoop:
 			c.failOutstanding()
 			return
 		}
+		c.noteDispatched(req)
 		if req.PostMode {
 			// Two-phase POST: flush "POST\r\n" immediately so the server can
 			// respond with 340/440 before we send the article body. Blocking
@@ -1300,46 +1753,118 @@ func (c *NNTPConnection) readerLoop() {
 		outRef := &writerRef{w: out}
 
 		// Progress-aware deadline: before the first response byte we honor the
-		// attempt deadline (dispatch + TTFB bound); once bytes flow we switch to
-		// a rolling stall deadline that the wire progress keeps extending, so a
-		// healthy-but-slow body never trips it. The caller's own ctx deadline
-		// always still applies as an upper bound.
+		// attempt window as a TTFB bound — re-anchored at drain start, so time
+		// a request spent queued behind other pipelined responses never counts
+		// against it (replies are FIFO; the server has not even seen slowness).
+		// A dispatch-anchored deadline here lets one deep request burst arrive
+		// with its windows pre-expired, and the resulting read timeouts tear
+		// the connection down and fail every pipelined neighbour with
+		// "connection died" (observed live during wide STAT sweeps). Once bytes
+		// flow we switch to the rolling stall deadline. The caller's own ctx
+		// deadline applies as an upper bound only while the caller still wants
+		// the response: once the request is abandoned (attempt expired and
+		// failed over, or caller ctx done) its deadlines are stale and only the
+		// drain-anchored window / stall bound governs — the server must keep
+		// making progress, nothing more.
 		stall := c.stallTimeout
 		lastBytes := 0
 		var stallDeadline time.Time
 		var firstByteAt time.Time
 		respStart := time.Now()
-		err := c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
-			if deliver {
-				select {
-				case <-req.Ctx.Done():
-					deliver = false
-					outRef.w = io.Discard
-				default:
-				}
+		abandoned := func() bool {
+			return req.attemptState.Load() == attemptAbandoned || req.Ctx.Err() != nil
+		}
+		ttfbBound := func() (time.Time, bool) {
+			if req.attemptWindow > 0 {
+				return respStart.Add(req.attemptWindow), true
 			}
-			if wireBytes > lastBytes {
-				lastBytes = wireBytes
-				if firstByteAt.IsZero() {
-					firstByteAt = time.Now()
-				}
-				req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
-				if stall > 0 {
-					if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
-						stallDeadline = dl
+			if !req.attemptDeadline.IsZero() {
+				return req.attemptDeadline, true
+			}
+			return time.Time{}, false
+		}
+		abortDrain := false
+		drain := func() error {
+			return c.rb.feedUntilDone(c.conn, &decoder, outRef, func(wireBytes int) (time.Time, bool) {
+				if deliver {
+					select {
+					case <-req.Ctx.Done():
+						deliver = false
+						outRef.w = io.Discard
+					default:
 					}
 				}
-			}
-			parentDL, hasParent := req.Ctx.Deadline()
-			switch {
-			case lastBytes == 0 && !req.attemptDeadline.IsZero():
-				return minDeadline(req.attemptDeadline, parentDL, hasParent)
-			case lastBytes > 0 && stall > 0:
-				return minDeadline(stallDeadline, parentDL, hasParent)
-			default:
+				// Nobody wants this body any more. Draining keeps the
+				// connection in sync, but past a point a reconnect is far
+				// cheaper than the bytes: a closed player's read-ahead on
+				// 4 MiB parts would otherwise keep the wire busy for seconds.
+				if !deliver && c.abortDrainBytes > 0 && decoder.YEnc.PartSize > 0 &&
+					decoder.YEnc.PartSize-int64(decoder.BytesDecoded) > c.abortDrainBytes {
+					abortDrain = true
+					return time.Unix(0, 0), true
+				}
+				if wireBytes > lastBytes {
+					lastBytes = wireBytes
+					if firstByteAt.IsZero() {
+						firstByteAt = time.Now()
+					}
+					req.attemptState.CompareAndSwap(attemptPending, attemptCommitted)
+					if stall > 0 {
+						if dl := time.Now().Add(stall); dl.Sub(stallDeadline) >= stallDeadlineQuantum {
+							stallDeadline = dl
+						}
+					}
+				}
+				if lastBytes > 0 {
+					// Committed: the attempt owns the wire and the caller's
+					// own deadline no longer applies at all, abandoned or
+					// not — see the field comment. Folding a live parentDL
+					// in here (the pre-fix behavior) raced the caller's
+					// timer against this exact deadline, since both target
+					// the same instant: whichever timer the Go runtime
+					// resolved first decided whether the read returned
+					// "abandoned" (parentDL fired, ctx.Err() not yet set)
+					// or genuinely abandoned, and a queued neighbor request
+					// paid for the wrong guess with the whole connection.
+					if stall > 0 {
+						return stallDeadline, true
+					}
+					return time.Time{}, false
+				}
+				parentDL, hasParent := req.Ctx.Deadline()
+				if abandoned() {
+					// Stale caller deadlines must not govern the drain.
+					parentDL, hasParent = time.Time{}, false
+				}
+				if bound, ok := ttfbBound(); ok {
+					return minDeadline(bound, parentDL, hasParent)
+				}
 				return parentDL, hasParent
+			})
+		}
+		err := drain()
+		if abortDrain {
+			// Surface as connection death so the teardown below runs and
+			// pending neighbours are retried through the usual path.
+			err = c.connDiedErr()
+		}
+		// A read that timed out on a caller deadline may have raced the very
+		// abandonment that invalidates it (the tryGroup timer fires at the same
+		// instant the attempt deadline expires, and a caller ctx expiring IS the
+		// abandonment). Re-check and resume the drain under the surviving bound
+		// instead of surfacing a timeout that would kill the connection; a
+		// genuinely stalled server still runs out the drain-anchored window (or
+		// the stall clock) and dies below.
+		for err != nil && !abortDrain && isTimeoutErr(err) && abandoned() {
+			bound, ok := ttfbBound()
+			if lastBytes > 0 {
+				bound, ok = stallDeadline, stall > 0
 			}
-		})
+			if !ok || !time.Now().Before(bound) {
+				break
+			}
+			err = drain()
+		}
 		if err != nil {
 			if c.providerName != "" {
 				resp.Err = fmt.Errorf("%s: %w", c.providerName, err)
@@ -1433,11 +1958,16 @@ func (c *NNTPConnection) readerLoop() {
 		if req.heldBody {
 			<-c.bodySem
 		}
+		if req.heldPrio {
+			<-c.prioBodySem
+		}
+		c.releaseBackground(req)
+		c.pokeWriter()
 
 		// If we hit a timeout, cancellation-related network error, or protocol
 		// desync, close the connection so the pool replaces it with a fresh one.
 		if resp.Err != nil {
-			if isTimeoutErr(resp.Err) {
+			if isTimeoutErr(resp.Err) || abortDrain {
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -1544,6 +2074,28 @@ type Provider struct {
 	KeepAlive       time.Duration // TCP keep-alive interval; 0 defaults to 30s; negative disables
 	ReconnectDelay  time.Duration // 0 disables auto-reconnect after 502; when set, re-adds provider after this delay
 
+	// StreamInflight caps priority-lane bodies in flight per connection, so a
+	// demand read never queues behind more than StreamInflight-1 stream
+	// bodies on its connection while normal-lane bodies keep Inflight.
+	// 0 defaults to min(Inflight, 4); a value >= Inflight disables the cap.
+	StreamInflight int
+
+	// BackgroundFloor is how many background-lane requests (BodyBackground,
+	// StatBackground, StatMany with Background) this provider keeps in flight
+	// while priority or normal traffic is recent. When the provider is idle
+	// background may use every connection; the floor only bounds it under
+	// contention so a stream never finds more than this many connections stuck
+	// behind background bodies. 0 defaults to max(1, Connections/4); values
+	// are clamped to [1, Connections-1] (or 1 for a single connection).
+	BackgroundFloor int
+
+	// AbortDrainBytes: when a body's request is cancelled while its bytes are
+	// still arriving, the connection normally drains the rest to stay in sync.
+	// If more than this many bytes remain, the connection is closed instead
+	// and its slot reconnects; pending neighbours are retried by the caller's
+	// connection-death handling. 0 defaults to 1 MiB; negative disables.
+	AbortDrainBytes int64
+
 	// AttemptTimeout bounds dispatch plus time-to-first-response-byte for each
 	// attempt against this provider (it does NOT bound the body transfer, which
 	// is governed by StallTimeout). 0 selects an adaptive value derived from the
@@ -1594,19 +2146,21 @@ type Provider struct {
 }
 
 type providerGroup struct {
-	name      string
-	host      string // raw Provider.Host; empty for Factory-based providers
-	skipID    string // Provider.StorageGroup when set, else host; identity used for 430 skipping
-	maxConns  int
-	ctx       context.Context // cancelled on removal/close
-	reqCh     chan *Request
-	prioCh    chan *Request // priority requests; connections prefer this over reqCh
-	hotReqCh  chan *Request // unbuffered; hot (connected) connections read this
-	hotPrioCh chan *Request // unbuffered; hot priority connections read this
-	gate      *connGate
-	stats     providerStats
-	cancel    context.CancelFunc // cancels this group's slot goroutines
-	p         Provider           // original config; used for auto-reconnect
+	name          string
+	host          string // raw Provider.Host; empty for Factory-based providers
+	skipID        string // Provider.StorageGroup when set, else host; identity used for 430 skipping
+	maxConns      int
+	ctx           context.Context // cancelled on removal/close
+	reqCh         chan *Request
+	prioCh        chan *Request // priority requests; connections prefer this over reqCh
+	hotReqCh      chan *Request // unbuffered; hot (connected) connections read this
+	hotPrioCh     chan *Request // unbuffered; hot priority connections read this
+	hotIdleBodyCh chan *Request // unbuffered; only connections with no body in flight read this
+	bgCh          chan *Request // background lane; read only when prioCh and reqCh are empty, capped while foreground is recent
+	gate          *connGate
+	stats         providerStats
+	cancel        context.CancelFunc // cancels this group's slot goroutines
+	p             Provider           // original config; used for auto-reconnect
 
 	// Quota period configuration. quotaBytes/quotaUsed/quotaExceeded live in
 	// stats so that NNTPConnection can update them via its *providerStats pointer.
@@ -1848,18 +2402,17 @@ func resolveProviderName(p Provider, index int) string {
 // startProviderGroup creates a providerGroup, pings the provider, and launches
 // connection slot goroutines. The caller is responsible for storing the group.
 func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
-	inflight := p.Inflight
-	if inflight <= 0 {
-		inflight = 1
-	}
-	// STAT (bodyless) may pipeline deeper than BODY. The overall pipeline cap is
-	// max(Inflight, StatInflight); 0 or a smaller value means "same as Inflight"
-	// (no separate STAT lane — fully backward compatible).
-	statInflight := p.StatInflight
-	if statInflight < inflight {
-		statInflight = inflight
-	}
+	g, factory := c.newProviderGroup(p, index)
+	c.pingProviderGroup(g, p, factory)
+	c.launchConnSlots(g, p, factory)
+	return g
+}
 
+// newProviderGroup builds the group and resolves its connection factory. It
+// performs no I/O and starts no goroutines, so a caller with many providers can
+// construct them all and then ping them concurrently (see NewClient) instead of
+// paying one handshake timeout per provider, serially.
+func (c *Client) newProviderGroup(p Provider, index int) (*providerGroup, ConnFactory) {
 	factory := p.Factory
 	if factory == nil {
 		host := p.Host
@@ -1875,21 +2428,24 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	gctx, gcancel := context.WithCancel(c.ctx)
 
 	g := &providerGroup{
-		name:        name,
-		host:        p.Host,
-		skipID:      providerSkipID(p),
-		maxConns:    p.Connections,
-		ctx:         gctx,
-		reqCh:       make(chan *Request, p.Connections),
-		prioCh:      make(chan *Request, p.Connections),
-		hotReqCh:    make(chan *Request),
-		hotPrioCh:   make(chan *Request),
-		gate:        gate,
-		cancel:      gcancel,
-		p:           p,
-		quotaPeriod: p.QuotaPeriod,
+		name:          name,
+		host:          p.Host,
+		skipID:        providerSkipID(p),
+		maxConns:      p.Connections,
+		ctx:           gctx,
+		reqCh:         make(chan *Request, p.Connections),
+		prioCh:        make(chan *Request, p.Connections),
+		hotReqCh:      make(chan *Request),
+		hotPrioCh:     make(chan *Request),
+		hotIdleBodyCh: make(chan *Request),
+		bgCh:          make(chan *Request, p.Connections),
+		gate:          gate,
+		cancel:        gcancel,
+		p:             p,
+		quotaPeriod:   p.QuotaPeriod,
 	}
 	g.stats.quotaBytes = p.QuotaBytes
+	g.stats.bgFloor = resolveBackgroundFloor(p.Connections, p.BackgroundFloor)
 	if p.QuotaBytes > 0 {
 		if p.QuotaUsed > 0 {
 			g.stats.quotaUsed.Store(p.QuotaUsed)
@@ -1906,16 +2462,40 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 		}
 	}
 
+	return g, factory
+}
+
+// pingProviderGroup performs the startup handshake probe and records it on the
+// group. Safe to run concurrently for distinct groups: it only touches g.stats
+// for its own group, which no other goroutine reads until the group is stored.
+func (c *Client) pingProviderGroup(g *providerGroup, p Provider, factory ConnFactory) {
 	// Ping with a short timeout so we don't block forever.
-	if !p.SkipPing {
-		pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
-		g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
-		pingCancel()
-		// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
-		// timeout has a sensible starting point before any request completes.
-		if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
-			g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
-		}
+	if p.SkipPing {
+		return
+	}
+	pingCtx, pingCancel := context.WithTimeout(c.ctx, defaultHandshakeTimeout)
+	g.stats.Ping = pingProvider(pingCtx, factory, p.Auth)
+	pingCancel()
+	// Seed the TTFB EWMA from the measured RTT so the adaptive attempt
+	// timeout has a sensible starting point before any request completes.
+	if g.stats.Ping.Err == nil && g.stats.Ping.RTT > 0 {
+		g.stats.ttfbEWMA.Store(int64(g.stats.Ping.RTT))
+	}
+}
+
+// launchConnSlots resolves the remaining per-connection settings and starts one
+// slot goroutine per configured connection.
+func (c *Client) launchConnSlots(g *providerGroup, p Provider, factory ConnFactory) {
+	inflight := p.Inflight
+	if inflight <= 0 {
+		inflight = 1
+	}
+	// STAT (bodyless) may pipeline deeper than BODY. The overall pipeline cap is
+	// max(Inflight, StatInflight); 0 or a smaller value means "same as Inflight"
+	// (no separate STAT lane — fully backward compatible).
+	statInflight := p.StatInflight
+	if statInflight < inflight {
+		statInflight = inflight
 	}
 
 	// Resolve the rolling stall timeout: 0 => default, negative => disabled.
@@ -1944,6 +2524,20 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 	if minConns > p.Connections {
 		minConns = p.Connections
 	}
+	streamInflight := p.StreamInflight
+	if streamInflight <= 0 {
+		streamInflight = min(inflight, defaultStreamInflight)
+	}
+	if streamInflight >= inflight {
+		streamInflight = 0 // no separate bound
+	}
+	abortDrain := p.AbortDrainBytes
+	switch {
+	case abortDrain == 0:
+		abortDrain = defaultAbortDrainBytes
+	case abortDrain < 0:
+		abortDrain = 0
+	}
 	for i := range p.Connections {
 		preWarm := i < minConns
 		idleTimeout := p.IdleTimeout
@@ -1953,10 +2547,8 @@ func (c *Client) startProviderGroup(p Provider, index int) *providerGroup {
 			idleTimeout = 0
 		}
 		c.wg.Add(1)
-		go runConnSlot(gctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, factory, inflight, statInflight, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, gate, &g.stats, name, &c.wg, preWarm)
+		go runConnSlot(g.ctx, g.reqCh, g.prioCh, g.hotReqCh, g.hotPrioCh, g.hotIdleBodyCh, g.bgCh, factory, inflight, statInflight, streamInflight, abortDrain, p.Auth, p.UserAgent, idleTimeout, stall, kaInterval, kaCmd, g.gate, &g.stats, g.name, &c.wg, preWarm)
 	}
-
-	return g
 }
 
 func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) (*Client, error) {
@@ -2017,9 +2609,32 @@ func NewClient(ctx context.Context, providers []Provider, opts ...ClientOption) 
 	c.mainGroups.Store(&[]*providerGroup{})
 	c.backupGroups.Store(&[]*providerGroup{})
 
+	// Build every group first (no I/O), then ping them all at once. The ping is
+	// bounded by defaultHandshakeTimeout per provider, so doing it serially cost
+	// N × 10s when the hosts are unreachable — with callers (AltMount) holding a
+	// write lock across NewClient, that stalled the whole app on a config
+	// change. Concurrent pings make the worst case ~one timeout, not N.
+	groups := make([]*providerGroup, len(providers))
+	factories := make([]ConnFactory, len(providers))
+	for pi, p := range providers {
+		groups[pi], factories[pi] = c.newProviderGroup(p, pi)
+	}
+	var pingWG sync.WaitGroup
+	for pi, p := range providers {
+		pingWG.Add(1)
+		go func() {
+			defer pingWG.Done()
+			c.pingProviderGroup(groups[pi], p, factories[pi])
+		}()
+	}
+	pingWG.Wait()
+
+	// Slots start only once every ping has landed, matching the previous
+	// ordering: g.stats.Ping is complete before any request can be dispatched.
 	var mainGs, backupGs []*providerGroup
 	for pi, p := range providers {
-		g := c.startProviderGroup(p, pi)
+		g := groups[pi]
+		c.launchConnSlots(g, p, factories[pi])
 		if p.Backup {
 			backupGs = append(backupGs, g)
 		} else {
@@ -2075,7 +2690,25 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 		metaFn = onMeta[0]
 	}
 
-	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, true)
+	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, lanePriority)
+	return respCh
+}
+
+// SendBackground is like Send but enqueues the request on the background
+// lane, which connections read only when the priority and normal lanes are
+// empty and which is capped per provider while foreground traffic is recent.
+func (c *Client) SendBackground(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta ...func(YEncMeta)) <-chan Response {
+	respCh := make(chan Response, 1)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var metaFn func(YEncMeta)
+	if len(onMeta) > 0 {
+		metaFn = onMeta[0]
+	}
+
+	go c.doSendWithRetry(ctx, payload, bodyWriter, metaFn, respCh, laneBackground)
 	return respCh
 }
 
@@ -2086,12 +2719,12 @@ func (c *Client) SendPriority(ctx context.Context, payload []byte, bodyWriter io
 // what a caller that wants to get on with something else meanwhile needs. A
 // caller that blocks on the reply immediately does not: the goroutine is pure
 // overhead, and on a sweep that is one goroutine per message-id.
-func (c *Client) sendSync(ctx context.Context, payload []byte, priority bool) Response {
+func (c *Client) sendSync(ctx context.Context, payload []byte, ln lane) Response {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	respCh := make(chan Response, 1)
-	c.doSendWithRetry(ctx, payload, nil, nil, respCh, priority)
+	c.doSendWithRetry(ctx, payload, nil, nil, respCh, ln)
 	return <-respCh
 }
 
@@ -2174,7 +2807,7 @@ func (c *Client) raceCandidates(
 	// Single live candidate: skip the probe RTT and send the real payload directly.
 	if len(live) == 1 {
 		g := live[0]
-		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, true)
+		resp, ok, done := c.tryGroup(ctx, g, payload, bodyWriter, onMeta, lanePriority)
 		if done {
 			return false, true, lastErr
 		}
@@ -2208,7 +2841,7 @@ func (c *Client) raceCandidates(
 	results := make(chan probeResult, len(live))
 	for _, g := range live {
 		go func(g *providerGroup) {
-			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, true)
+			resp, ok, done := c.tryGroup(ctx, g, statPayload, nil, nil, lanePriority)
 			results <- probeResult{g: g, resp: resp, ok: ok, cancelled: done}
 		}(g)
 	}
@@ -2262,7 +2895,7 @@ func (c *Client) raceCandidates(
 	}
 
 	// Send the real payload to the winner on the priority lane.
-	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, true)
+	resp, ok, done := c.tryGroup(ctx, winner, payload, bodyWriter, onMeta, lanePriority)
 	if done {
 		return false, true, lastErr
 	}
@@ -2336,9 +2969,9 @@ func (c *Client) tryGroup(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	priority bool,
+	ln lane,
 ) (resp Response, ok bool, done bool) {
-	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, 0)
+	return c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, ln, 0)
 }
 
 // tryGroupTimeout is tryGroup with an explicit attempt window — the seam that
@@ -2350,7 +2983,7 @@ func (c *Client) tryGroupTimeout(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	priority bool,
+	ln lane,
 	attemptTimeout time.Duration,
 ) (resp Response, ok bool, done bool) {
 	attemptTimeout = g.windowOr(attemptTimeout)
@@ -2365,38 +2998,74 @@ func (c *Client) tryGroupTimeout(
 		BodyWriter:      bodyWriter,
 		OnMeta:          onMeta,
 		attemptDeadline: time.Now().Add(attemptTimeout),
+		attemptWindow:   attemptTimeout,
 		providerName:    g.name,
+		lane:            ln,
 	}
 
+	// The attempt timer bounds dispatch plus time-to-first-byte. A background
+	// request is meant to wait — the lane holds it back for as long as
+	// foreground traffic keeps the gate closed — so queue time must not count
+	// against it: no client-side timer and no dispatch deadline. Once a
+	// connection starts draining its reply, the reader still applies
+	// attemptWindow from that moment, so a hung server is caught as usual.
 	timer := time.NewTimer(attemptTimeout)
 	defer timer.Stop()
+	var timerC <-chan time.Time
+	if ln == laneBackground {
+		req.attemptDeadline = time.Time{}
+	} else {
+		timerC = timer.C
+	}
 
 	var hotCh chan *Request
 	var coldCh chan *Request
-	if priority {
+	switch ln {
+	case lanePriority:
 		hotCh = g.hotPrioCh
 		coldCh = g.prioCh
-	} else {
+	case laneBackground:
+		// No hot variant: background work is never worth waking a cold slot
+		// ahead of anything, and a nil hotCh is never ready in the select.
+		coldCh = g.bgCh
+	default:
 		hotCh = g.hotReqCh
 		coldCh = g.reqCh
 	}
 
-	select {
-	case hotCh <- req:
-	default:
+	// A priority BODY prefers a connection with no body in flight. NNTP replies
+	// are FIFO per connection, so landing behind an in-flight article costs the
+	// whole transfer. Only body-free connections read hotIdleBodyCh, and only
+	// while they stay body-free, so nothing is reserved: when no priority body
+	// is in play nothing is ever sent here and every connection serves the
+	// normal lane exactly as before.
+	dispatched := false
+	if ln == lanePriority && !isCheapCommand(payload) {
 		select {
-		case <-c.ctx.Done():
-			return Response{}, false, true
-		case <-reqCtx.Done():
-			return Response{}, false, ctx.Err() != nil
-		case <-g.ctx.Done():
-			return Response{}, false, false
-		case <-timer.C:
-			// Could not be dispatched within the attempt window: the provider
-			// is saturated. Fail over — with the reason preserved, so the
-			// terminal error names the saturation instead of arriving bare.
-			return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
-		case coldCh <- req:
+		case g.hotIdleBodyCh <- req:
+			dispatched = true
+		default:
+		}
+	}
+
+	if !dispatched {
+		select {
+		case hotCh <- req:
+		default:
+			select {
+			case <-c.ctx.Done():
+				return Response{}, false, true
+			case <-reqCtx.Done():
+				return Response{}, false, ctx.Err() != nil
+			case <-g.ctx.Done():
+				return Response{}, false, false
+			case <-timerC:
+				// Could not be dispatched within the attempt window: the provider
+				// is saturated. Fail over — with the reason preserved, so the
+				// terminal error names the saturation instead of arriving bare.
+				return Response{Err: &AttemptTimeoutError{Provider: g.name, Timeout: attemptTimeout, Phase: PhaseDispatch}}, false, false
+			case coldCh <- req:
+			}
 		}
 	}
 
@@ -2410,7 +3079,7 @@ func (c *Client) tryGroupTimeout(
 			return Response{}, false, false
 		case <-reqCtx.Done():
 			return Response{}, false, ctx.Err() != nil
-		case <-timer.C:
+		case <-timerC:
 			if req.attemptState.CompareAndSwap(attemptPending, attemptAbandoned) {
 				// No response byte arrived in time: hung or too-slow to start.
 				// Cancel so the reader drops the request, and fail over. The
@@ -2514,7 +3183,7 @@ func speedScore(speed, maxSpeed float64) int {
 }
 
 func (c *Client) sendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response) {
-	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, false)
+	c.doSendWithRetry(ctx, payload, bodyWriter, onMeta, respCh, laneNormal)
 }
 
 // tryGroupResilient retries a single provider on a fresh connection when a
@@ -2531,7 +3200,7 @@ func (c *Client) tryGroupResilient(
 	payload []byte,
 	bodyWriter io.Writer,
 	onMeta func(YEncMeta),
-	priority bool,
+	ln lane,
 	window time.Duration,
 ) (resp Response, ok bool, cancelled bool) {
 	// window == 0 uses the provider's adaptive attempt window. A positive
@@ -2544,7 +3213,7 @@ func (c *Client) tryGroupResilient(
 	// untouched: within a pass a quiet provider still costs one base window.
 	timeout := g.windowOr(window)
 	for r := 0; ; r++ {
-		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, priority, timeout)
+		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, ln, timeout)
 		if cancelled {
 			return
 		}
@@ -2628,7 +3297,7 @@ func expiredAwaitingResponse(resp Response, ok bool) bool {
 	return isTimeoutErr(resp.Err)
 }
 
-func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, priority bool) {
+func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter io.Writer, onMeta func(YEncMeta), respCh chan Response, ln lane) {
 	defer close(respCh)
 
 	// Precompute for STAT probe: extract message-ID once.
@@ -2730,7 +3399,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 			if escalated {
 				attemptStart = time.Now()
 			}
-			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, window)
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, ln.escalated(post430), window)
 			if escalated {
 				budget -= time.Since(attemptStart)
 			}
@@ -2798,7 +3467,12 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrServiceUnavailable)
 				continue
 			}
-			if resp.StatusCode == 430 {
+			// 423 ("no article with that number") is the same miss as 430 for
+			// dispatch purposes — errors.go folds both into ErrArticleNotFound
+			// and raceCandidates already treats them alike. Handling only 430
+			// here delivered a 423 straight to the caller with no failover to
+			// the remaining mains or the backups.
+			if resp.StatusCode == 430 || resp.StatusCode == 423 {
 				c.nextIdx.Add(1) // bias next request away from this provider
 				if g.skipID != "" && skipCount < len(skipHosts) {
 					skipHosts[skipCount] = g.skipID
@@ -2903,7 +3577,7 @@ func (c *Client) doSendWithRetry(ctx context.Context, payload []byte, bodyWriter
 				lastErr = fmt.Errorf("%s: %w", g.name, ErrQuotaExceeded)
 				continue
 			}
-			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, priority || post430, 0)
+			resp, ok, cancelled := c.tryGroupResilient(ctx, g, payload, bodyWriter, onMeta, ln.escalated(post430), 0)
 			if cancelled {
 				err := ctx.Err()
 				if err == nil {
