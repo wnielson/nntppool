@@ -225,3 +225,5 @@ tool (
 	go.uber.org/mock/mockgen
 	golang.org/x/vuln/cmd/govulncheck
 )
+
+replace github.com/mnightingale/rapidyenc => github.com/wnielson/rapidyenc v0.0.0-20261001015330-9a2f60a15493

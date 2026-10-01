@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -367,6 +368,65 @@ func TestPostYenc_Success(t *testing.T) {
 	}
 	if !strings.Contains(got, "name=test.bin") {
 		t.Error("missing filename in yEnc header")
+	}
+}
+
+func TestYencEncoderPoolReusesResetEncoder(t *testing.T) {
+	yencEncoderPool = sync.Pool{}
+	t.Cleanup(func() { yencEncoderPool = sync.Pool{} })
+
+	firstMeta := rapidyenc.Meta{
+		FileName: "first.bin", FileSize: 1, PartSize: 1,
+		PartNumber: 1, TotalParts: 1,
+	}
+	secondMeta := rapidyenc.Meta{
+		FileName: "second.bin", FileSize: 128, PartSize: 128,
+		PartNumber: 1, TotalParts: 1,
+	}
+
+	var first bytes.Buffer
+	encoder, err := acquireYencEncoder(&first, firstMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := encoder.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	releaseYencEncoder(encoder)
+
+	payload := make([]byte, secondMeta.PartSize)
+	var reused bytes.Buffer
+	reusedEncoder, err := acquireYencEncoder(&reused, secondMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reusedEncoder != encoder {
+		t.Fatal("encoder was not reused from pool")
+	}
+	if _, err := reusedEncoder.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := reusedEncoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	releaseYencEncoder(reusedEncoder)
+
+	var fresh bytes.Buffer
+	freshEncoder, err := rapidyenc.NewEncoder(&fresh, secondMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := freshEncoder.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := freshEncoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reused.Bytes(), fresh.Bytes()) {
+		t.Fatalf("reused encoder output differs from fresh encoder")
 	}
 }
 
