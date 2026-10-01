@@ -8,10 +8,28 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mnightingale/rapidyenc"
 )
+
+var yencEncoderPool sync.Pool
+
+func acquireYencEncoder(w io.Writer, meta rapidyenc.Meta) (*rapidyenc.Encoder, error) {
+	if pooled := yencEncoderPool.Get(); pooled != nil {
+		encoder := pooled.(*rapidyenc.Encoder)
+		if err := encoder.Reset(w, meta); err != nil {
+			return nil, err
+		}
+		return encoder, nil
+	}
+	return rapidyenc.NewEncoder(w, meta)
+}
+
+func releaseYencEncoder(encoder *rapidyenc.Encoder) {
+	yencEncoderPool.Put(encoder)
+}
 
 // ArticleEncoding describes the transfer encoding detected in an article body.
 type ArticleEncoding int
@@ -339,7 +357,7 @@ func (c *Client) postYenc(ctx context.Context, headers PostHeaders, body io.Read
 			return
 		}
 		var enc *rapidyenc.Encoder
-		enc, err = rapidyenc.NewEncoder(pw, meta)
+		enc, err = acquireYencEncoder(pw, meta)
 		if err != nil {
 			return
 		}
@@ -349,6 +367,7 @@ func (c *Client) postYenc(ctx context.Context, headers PostHeaders, body io.Read
 		if err = enc.Close(); err != nil {
 			return
 		}
+		releaseYencEncoder(enc)
 		// rapidyenc's Close already terminates the last line with CRLF, so we
 		// only need the dot-line terminator here. Writing "\r\n.\r\n" would
 		// inject a stray blank line before the dot.
