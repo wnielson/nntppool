@@ -226,6 +226,13 @@ type Request struct {
 
 	// providerName identifies the provider group selected for this attempt.
 	providerName string
+
+	// connection is assigned before dispatch on the wire. Transport failures
+	// retain it so retries can wait for teardown and use this slot's successor.
+	connection *NNTPConnection
+	// reconnecting requests must not be handed back to another hot socket when
+	// a provider temporarily refuses a replacement connection.
+	reconnecting bool
 }
 
 // lane is which of the three request queues an attempt is dispatched on.
@@ -242,6 +249,28 @@ const (
 	lanePriority
 	laneBackground
 )
+
+// connectionRetries belongs to a pool slot, surviving each socket's teardown.
+// Only that slot and its current connection receive these queues; a retry can
+// therefore reach a fresh authenticated socket without visiting stale peers.
+type connectionRetries struct {
+	queues [3]chan *Request
+}
+
+func newConnectionRetries() *connectionRetries {
+	r := &connectionRetries{}
+	for i := range r.queues {
+		r.queues[i] = make(chan *Request, 1)
+	}
+	return r
+}
+
+func (r *connectionRetries) queue(ln lane) chan *Request {
+	if r == nil {
+		return nil
+	}
+	return r.queues[ln]
+}
 
 // isPriority reports whether the request rides the priority lane.
 func (r *Request) isPriority() bool { return r.lane == lanePriority }
@@ -327,12 +356,13 @@ type NNTPConnection struct {
 
 	Greeting NNTPResponse
 
-	firstReq          *Request      // bootstrap request from connection slot
-	idleTimeout       time.Duration // 0 = no idle timeout
-	stallTimeout      time.Duration // rolling body-progress deadline; 0 = disabled
-	keepaliveInterval time.Duration // 0 = no keepalive
-	keepaliveCommand  string        // NNTP command for keepalive probe (e.g. "DATE")
-	providerName      string        // set by runConnSlot; used for error context
+	firstReq          *Request           // bootstrap request from connection slot
+	retries           *connectionRetries // queues owned by this connection's pool slot
+	idleTimeout       time.Duration      // 0 = no idle timeout
+	stallTimeout      time.Duration      // rolling body-progress deadline; 0 = disabled
+	keepaliveInterval time.Duration      // 0 = no keepalive
+	keepaliveCommand  string             // NNTP command for keepalive probe (e.g. "DATE")
+	providerName      string             // set by runConnSlot; used for error context
 	userAgent         string
 
 	stats *providerStats // nil for standalone connections
@@ -547,6 +577,8 @@ func isCheapCommand(payload []byte) bool {
 func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	if c.bgPending.Load() > 0 {
 		select {
+		case req, ok = <-c.retryLane(laneBackground):
+			return req, ok, true
 		case req, ok = <-c.bgLane():
 			return req, ok, true
 		default:
@@ -560,12 +592,22 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	}
 	hotPrio, coldPrio := c.prioLanes()
 	select {
+	case req, ok = <-c.retryLane(lanePriority):
+		return req, ok, true
+	default:
+	}
+	select {
 	case req, ok = <-hotPrio:
 		return req, ok, true
 	default:
 	}
 	select {
 	case req, ok = <-coldPrio:
+		return req, ok, true
+	default:
+	}
+	select {
+	case req, ok = <-c.retryLane(laneNormal):
 		return req, ok, true
 	default:
 	}
@@ -580,11 +622,35 @@ func (c *NNTPConnection) tryNextRequest() (req *Request, ok, got bool) {
 	default:
 	}
 	select {
+	case req, ok = <-c.retryLane(laneBackground):
+		return req, ok, true
+	default:
+	}
+	select {
 	case req, ok = <-c.bgLane():
 		return req, ok, true
 	default:
 	}
 	return nil, false, false
+}
+
+// Retry traffic retains its original lane and the normal pipeline/background
+// gates. A replacement connection may have already been pre-warmed by its slot.
+func (c *NNTPConnection) retryLane(ln lane) <-chan *Request {
+	ch := c.retries.queue(ln)
+	if ln == laneBackground {
+		if c.bgPending.Load() == 0 && !c.pipelineIdle() {
+			return nil
+		}
+		return backgroundLaneFor(c.stats, ch)
+	}
+	if c.bgPending.Load() > 0 {
+		return nil
+	}
+	if ln == lanePriority && c.prioBodySem != nil && len(c.prioBodySem) >= cap(c.prioBodySem) {
+		return nil
+	}
+	return ch
 }
 
 // bgLane returns the background lane this connection may read from, or nil
@@ -800,6 +866,15 @@ func failRequest(ch chan Response, err error) {
 	close(ch)
 }
 
+func failConnectionRequest(req *Request, err error) {
+	defer func() { _ = recover() }()
+	select {
+	case req.RespCh <- Response{Request: req, Err: err}:
+	default:
+	}
+	close(req.RespCh)
+}
+
 func (c *NNTPConnection) failOutstanding() {
 	c.failMu.Do(c.drainPending)
 }
@@ -833,7 +908,7 @@ func (c *NNTPConnection) drainPending() {
 			if req == nil {
 				continue
 			}
-			failRequest(req.RespCh, connErr)
+			failConnectionRequest(req, connErr)
 			c.releaseBackground(req)
 			// Best-effort inflight release (not strictly needed once we're shutting down).
 			select {
@@ -1019,6 +1094,7 @@ func (g *connGate) snapshot() (maxSlots, running int) {
 // so these connections are never torn down for being idle.
 func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Request, hotReqCh chan *Request, hotPrioCh chan *Request, hotIdleBodyCh chan *Request, bgCh chan *Request, factory ConnFactory, inflight int, statInflight int, streamInflight int, abortDrainBytes int64, auth Auth, userAgent string, idleTimeout time.Duration, stallTimeout time.Duration, keepaliveInterval time.Duration, keepaliveCommand string, gate *connGate, stats *providerStats, providerName string, wg *sync.WaitGroup, preWarm bool) {
 	defer wg.Done()
+	retries := newConnectionRetries()
 
 	// Shared read buffer persists across reconnections to avoid re-growing.
 	var sharedBuf readBuffer
@@ -1039,9 +1115,9 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		select {
 		case hotCh <- req:
 		case <-req.Ctx.Done():
-			failRequest(req.RespCh, req.Ctx.Err())
+			failConnectionRequest(req, req.Ctx.Err())
 		case <-ctx.Done():
-			failRequest(req.RespCh, ctx.Err())
+			failConnectionRequest(req, ctx.Err())
 		}
 	}
 
@@ -1064,16 +1140,35 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		var firstReq *Request
 		var ok bool
 		gateCtx := ctx
-		if !preWarm {
+		// A retry is reserved for this slot. Poll even pre-warmed slots; if a
+		// reconnect wins the race, its active writer reads the same queues.
+		retryBg := backgroundLaneFor(stats, retries.queue(laneBackground))
+		select {
+		case firstReq = <-retries.queue(lanePriority):
+		default:
+			select {
+			case firstReq = <-retries.queue(laneNormal):
+			default:
+				select {
+				case firstReq = <-retryBg:
+				default:
+				}
+			}
+		}
+		if !preWarm && firstReq == nil {
 			// Prefer priority requests over normal ones.
 			bgLane := backgroundLaneFor(stats, bgCh)
 			select {
+			case firstReq = <-retries.queue(lanePriority):
 			case firstReq, ok = <-prioCh:
 				if !ok {
 					return
 				}
 			default:
 				select {
+				case firstReq = <-retries.queue(lanePriority):
+				case firstReq = <-retries.queue(laneNormal):
+				case firstReq = <-retryBg:
 				case firstReq, ok = <-prioCh:
 					if !ok {
 						return
@@ -1092,12 +1187,13 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 					return
 				}
 			}
+		}
+		if firstReq != nil {
 			gateCtx = firstReq.Ctx
-
 			// Check if the request is already cancelled.
 			select {
 			case <-firstReq.Ctx.Done():
-				failRequest(firstReq.RespCh, firstReq.Ctx.Err())
+				failConnectionRequest(firstReq, firstReq.Ctx.Err())
 				continue
 			default:
 			}
@@ -1111,7 +1207,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if firstReq != nil {
 			var running int
 			entered, running = gate.tryEnter()
-			if !entered && running > 0 {
+			if !entered && running > 0 && !firstReq.reconnecting {
 				handoffToActive(firstReq)
 				continue
 			}
@@ -1119,7 +1215,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if !entered && !gate.enter(ctx, gateCtx) {
 			// Slot or request context cancelled while waiting at the gate.
 			if firstReq != nil {
-				failRequest(firstReq.RespCh, context.Canceled)
+				failConnectionRequest(firstReq, context.Canceled)
 			}
 			continue
 		}
@@ -1128,7 +1224,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		if err != nil {
 			gate.exit()
 			if firstReq != nil {
-				failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+				failConnectionRequest(firstReq, fmt.Errorf("%s: %w", providerName, err))
 			}
 			// Backoff before retrying to avoid thrashing.
 			select {
@@ -1153,10 +1249,10 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 				gate.throttle()
 				gate.exit()
 				_, running := gate.snapshot()
-				if firstReq != nil && running > 0 {
+				if firstReq != nil && running > 0 && !firstReq.reconnecting {
 					handoffToActive(firstReq)
 				} else if firstReq != nil {
-					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+					failConnectionRequest(firstReq, fmt.Errorf("%s: %w", providerName, err))
 				}
 				select {
 				case <-time.After(maxConnsBackoff):
@@ -1166,7 +1262,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 			} else {
 				gate.exit()
 				if firstReq != nil {
-					failRequest(firstReq.RespCh, fmt.Errorf("%s: %w", providerName, err))
+					failConnectionRequest(firstReq, fmt.Errorf("%s: %w", providerName, err))
 				}
 				select {
 				case <-time.After(connFailureBackoff):
@@ -1187,6 +1283,7 @@ func runConnSlot(ctx context.Context, reqCh <-chan *Request, prioCh <-chan *Requ
 		}
 		nc.abortDrainBytes = abortDrainBytes
 		nc.firstReq = firstReq
+		nc.retries = retries
 		nc.idleTimeout = idleTimeout
 		nc.stallTimeout = stallTimeout
 		nc.providerName = providerName
@@ -1280,6 +1377,7 @@ func (c *NNTPConnection) Run() {
 	if c.firstReq != nil {
 		req := c.firstReq
 		c.firstReq = nil
+		req.connection = c
 
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
@@ -1288,7 +1386,7 @@ func (c *NNTPConnection) Run() {
 		// Check cancellation.
 		select {
 		case <-req.Ctx.Done():
-			failRequest(req.RespCh, req.Ctx.Err())
+			failConnectionRequest(req, req.Ctx.Err())
 			// Connection is still good — fall through to main loop.
 			goto mainLoop
 		default:
@@ -1298,7 +1396,7 @@ func (c *NNTPConnection) Run() {
 		select {
 		case c.inflightSem <- struct{}{}:
 		case <-c.ctx.Done():
-			failRequest(req.RespCh, c.ctx.Err())
+			failConnectionRequest(req, c.ctx.Err())
 			return
 		}
 
@@ -1311,11 +1409,11 @@ func (c *NNTPConnection) Run() {
 				req.heldBody = true
 			case <-req.Ctx.Done():
 				<-c.inflightSem
-				failRequest(req.RespCh, req.Ctx.Err())
+				failConnectionRequest(req, req.Ctx.Err())
 				goto mainLoop // connection still good
 			case <-c.ctx.Done():
 				<-c.inflightSem
-				failRequest(req.RespCh, c.ctx.Err())
+				failConnectionRequest(req, c.ctx.Err())
 				return
 			}
 			// Priority-lane bodies are bounded tighter than Inflight so a
@@ -1328,12 +1426,12 @@ func (c *NNTPConnection) Run() {
 				case <-req.Ctx.Done():
 					<-c.bodySem
 					<-c.inflightSem
-					failRequest(req.RespCh, req.Ctx.Err())
+					failConnectionRequest(req, req.Ctx.Err())
 					goto mainLoop
 				case <-c.ctx.Done():
 					<-c.bodySem
 					<-c.inflightSem
-					failRequest(req.RespCh, c.ctx.Err())
+					failConnectionRequest(req, c.ctx.Err())
 					return
 				}
 			}
@@ -1344,7 +1442,7 @@ func (c *NNTPConnection) Run() {
 
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
-			failRequest(req.RespCh, err)
+			failConnectionRequest(req, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -1355,7 +1453,7 @@ func (c *NNTPConnection) Run() {
 			// respond with 340/440 before we send the article body.
 			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
-				failRequest(req.RespCh, err)
+				failConnectionRequest(req, err)
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -1390,7 +1488,7 @@ func (c *NNTPConnection) Run() {
 			if req.PayloadBody != nil {
 				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
 					<-c.inflightSem
-					failRequest(req.RespCh, err)
+					failConnectionRequest(req, err)
 					_ = c.conn.Close()
 					c.failOutstanding()
 					return
@@ -1466,6 +1564,9 @@ mainLoop:
 			idleBody, hotPrio, hotReq, coldPrio, reqLane := c.foregroundLanes()
 			bgLane := c.bgLane()
 			select {
+			case req, ok = <-c.retryLane(lanePriority):
+			case req, ok = <-c.retryLane(laneNormal):
+			case req, ok = <-c.retryLane(laneBackground):
 			case req, ok = <-idleBody:
 			case req, ok = <-hotPrio:
 			case req, ok = <-hotReq:
@@ -1546,6 +1647,7 @@ mainLoop:
 		if req.Ctx == nil {
 			req.Ctx = context.Background()
 		}
+		req.connection = c
 
 		// Reset idle timer since we got a request.
 		if idleTimer != nil {
@@ -1562,7 +1664,7 @@ mainLoop:
 		select {
 		case <-req.Ctx.Done():
 			<-c.inflightSem
-			failRequest(req.RespCh, req.Ctx.Err())
+			failConnectionRequest(req, req.Ctx.Err())
 			continue
 		default:
 		}
@@ -1582,7 +1684,7 @@ mainLoop:
 				// was never sent.
 				if err := flushBuffered(); err != nil {
 					<-c.inflightSem
-					failRequest(req.RespCh, err)
+					failConnectionRequest(req, err)
 					return
 				}
 				select {
@@ -1590,7 +1692,7 @@ mainLoop:
 					req.heldBody = true
 				case <-req.Ctx.Done():
 					<-c.inflightSem
-					failRequest(req.RespCh, req.Ctx.Err())
+					failConnectionRequest(req, req.Ctx.Err())
 					continue
 				case <-c.ctx.Done():
 					// The connection died with a request in hand. This arm is
@@ -1602,7 +1704,7 @@ mainLoop:
 					// connection at once); a bare return stranded it silently
 					// until the caller's whole attempt window expired.
 					<-c.inflightSem
-					failRequest(req.RespCh, c.connDiedErr())
+					failConnectionRequest(req, c.connDiedErr())
 					return
 				}
 			}
@@ -1618,7 +1720,7 @@ mainLoop:
 					if err := flushBuffered(); err != nil {
 						<-c.bodySem
 						<-c.inflightSem
-						failRequest(req.RespCh, err)
+						failConnectionRequest(req, err)
 						return
 					}
 					select {
@@ -1627,12 +1729,12 @@ mainLoop:
 					case <-req.Ctx.Done():
 						<-c.bodySem
 						<-c.inflightSem
-						failRequest(req.RespCh, req.Ctx.Err())
+						failConnectionRequest(req, req.Ctx.Err())
 						continue
 					case <-c.ctx.Done():
 						<-c.bodySem
 						<-c.inflightSem
-						failRequest(req.RespCh, c.connDiedErr())
+						failConnectionRequest(req, c.connDiedErr())
 						return
 					}
 				}
@@ -1646,7 +1748,7 @@ mainLoop:
 		// pipeline write (buffered; flushed at top of loop before blocking)
 		if _, err := bw.Write(req.Payload); err != nil {
 			<-c.inflightSem
-			failRequest(req.RespCh, err)
+			failConnectionRequest(req, err)
 			_ = c.conn.Close()
 			c.failOutstanding()
 			return
@@ -1658,7 +1760,7 @@ mainLoop:
 			// here also prevents pipelining other requests during POST.
 			if err := bw.Flush(); err != nil {
 				<-c.inflightSem
-				failRequest(req.RespCh, err)
+				failConnectionRequest(req, err)
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -1692,7 +1794,7 @@ mainLoop:
 			if req.PayloadBody != nil {
 				if _, err := io.Copy(bw, req.PayloadBody); err != nil {
 					<-c.inflightSem
-					failRequest(req.RespCh, err)
+					failConnectionRequest(req, err)
 					_ = c.conn.Close()
 					c.failOutstanding()
 					return
@@ -1964,10 +2066,10 @@ func (c *NNTPConnection) readerLoop() {
 		c.releaseBackground(req)
 		c.pokeWriter()
 
-		// If we hit a timeout, cancellation-related network error, or protocol
-		// desync, close the connection so the pool replaces it with a fresh one.
+		// EOF, closed sockets, timeouts, and protocol desync retire the socket
+		// immediately; none can yield another correctly matched response.
 		if resp.Err != nil {
-			if isTimeoutErr(resp.Err) || abortDrain {
+			if isConnectionDeathError(resp.Err) || abortDrain {
 				_ = c.conn.Close()
 				c.failOutstanding()
 				return
@@ -2986,6 +3088,19 @@ func (c *Client) tryGroupTimeout(
 	ln lane,
 	attemptTimeout time.Duration,
 ) (resp Response, ok bool, done bool) {
+	return c.tryGroupAttempt(ctx, g, payload, bodyWriter, onMeta, ln, attemptTimeout, nil)
+}
+
+func (c *Client) tryGroupAttempt(
+	ctx context.Context,
+	g *providerGroup,
+	payload []byte,
+	bodyWriter io.Writer,
+	onMeta func(YEncMeta),
+	ln lane,
+	attemptTimeout time.Duration,
+	retries *connectionRetries,
+) (resp Response, ok bool, done bool) {
 	attemptTimeout = g.windowOr(attemptTimeout)
 	reqCtx, reqCancel := context.WithCancel(ctx)
 	defer reqCancel()
@@ -3001,6 +3116,7 @@ func (c *Client) tryGroupTimeout(
 		attemptWindow:   attemptTimeout,
 		providerName:    g.name,
 		lane:            ln,
+		reconnecting:    retries != nil,
 	}
 
 	// The attempt timer bounds dispatch plus time-to-first-byte. A background
@@ -3032,6 +3148,12 @@ func (c *Client) tryGroupTimeout(
 		hotCh = g.hotReqCh
 		coldCh = g.reqCh
 	}
+	if retries != nil {
+		// Only the failed connection's slot can receive this request. Waiting
+		// for that connection's done signal below ensures its old writer is gone.
+		hotCh = nil
+		coldCh = retries.queue(ln)
+	}
 
 	// A priority BODY prefers a connection with no body in flight. NNTP replies
 	// are FIFO per connection, so landing behind an in-flight article costs the
@@ -3040,7 +3162,7 @@ func (c *Client) tryGroupTimeout(
 	// is in play nothing is ever sent here and every connection serves the
 	// normal lane exactly as before.
 	dispatched := false
-	if ln == lanePriority && !isCheapCommand(payload) {
+	if retries == nil && ln == lanePriority && !isCheapCommand(payload) {
 		select {
 		case g.hotIdleBodyCh <- req:
 			dispatched = true
@@ -3212,8 +3334,9 @@ func (c *Client) tryGroupResilient(
 	// least as often as it is dead infrastructure. Failover order is
 	// untouched: within a pass a quiet provider still costs one base window.
 	timeout := g.windowOr(window)
+	var retries *connectionRetries
 	for r := 0; ; r++ {
-		resp, ok, cancelled = c.tryGroupTimeout(ctx, g, payload, bodyWriter, onMeta, ln, timeout)
+		resp, ok, cancelled = c.tryGroupAttempt(ctx, g, payload, bodyWriter, onMeta, ln, timeout, retries)
 		if cancelled {
 			return
 		}
@@ -3245,7 +3368,22 @@ func (c *Client) tryGroupResilient(
 			return
 		}
 		if r < maxConnDiedRetries && isConnectionDeathError(resp.Err) {
-			continue // dead connection drained; retry fresh on same provider
+			if resp.Request != nil && resp.Request.connection != nil {
+				failed := resp.Request.connection
+				if failed.retries != nil {
+					select {
+					case <-failed.done:
+						retries = failed.retries
+					case <-ctx.Done():
+						return Response{Err: ctx.Err()}, false, true
+					case <-c.ctx.Done():
+						return Response{Err: c.ctx.Err()}, false, true
+					case <-g.ctx.Done():
+						return resp, false, false
+					}
+				}
+			}
+			continue // retry on the failed slot's freshly authenticated successor
 		}
 		return
 	}
