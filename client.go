@@ -169,6 +169,24 @@ func (c *Client) BodyAsync(ctx context.Context, messageID string, w io.Writer, o
 	return ch
 }
 
+// BodyFrom retrieves an article body from the named provider only, without
+// falling back to another. The name is the provider's configured Name (or its
+// derived name), main or backup, as for PostYencTo. It tells whether one
+// provider can serve an article, which a STAT does not prove: a provider may
+// answer STAT for an article whose body it no longer has.
+func (c *Client) BodyFrom(ctx context.Context, provider, messageID string) (*ArticleBody, error) {
+	target := c.findGroup(provider)
+	if target == nil {
+		return nil, fmt.Errorf("nntp: provider %q not found", provider)
+	}
+	body, err := c.finishBody(messageID, nil, c.sendToGroup(ctx, target, []byte("BODY <"+messageID+">\r\n"), nil))
+	if body != nil {
+		body.Bytes = body.byteBuf
+		body.byteBuf = nil
+	}
+	return body, err
+}
+
 // Head retrieves the headers of an article.
 func (c *Client) Head(ctx context.Context, messageID string) (*ArticleHead, error) {
 	payload := []byte("HEAD <" + messageID + ">\r\n")

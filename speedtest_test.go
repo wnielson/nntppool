@@ -3,6 +3,7 @@ package nntppool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -346,5 +347,31 @@ func TestSpeedTest_ProviderNameNotFound(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for nonexistent provider name")
+	}
+}
+
+// BodyFrom asks the named provider only: the article one provider has gone
+// from is not fetched from another, so the caller learns what that one serves.
+func TestBodyFrom_AsksOnlyTheNamedProvider(t *testing.T) {
+	c, err := NewClient(context.Background(), []Provider{
+		{Name: "has", Host: "has.example:119", Factory: makeBodyFactory(t, 222), Connections: 1},
+		{Name: "lost", Host: "lost.example:119", Factory: makeBodyFactory(t, 430), Connections: 1},
+	})
+	if err != nil {
+		t.Fatalf("NewClient error: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := c.BodyFrom(ctx, "lost", "a@b"); !errors.Is(err, ErrArticleNotFound) {
+		t.Fatalf("BodyFrom(lost) = %v, want ErrArticleNotFound (no fallback to the provider that has it)", err)
+	}
+	body, err := c.BodyFrom(ctx, "has", "a@b")
+	if err != nil || len(body.Bytes) != 256 {
+		t.Fatalf("BodyFrom(has) = %v, %v", body, err)
+	}
+	if _, err := c.BodyFrom(ctx, "nobody", "a@b"); err == nil {
+		t.Fatal("BodyFrom to an unknown provider should fail")
 	}
 }
